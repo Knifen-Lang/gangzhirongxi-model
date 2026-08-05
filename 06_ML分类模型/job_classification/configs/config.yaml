@@ -1,0 +1,95 @@
+# ══════════════════════════════════════════════════════
+# 岗位分类系统 — 配置文件
+# 迁移自人工智能挑战赛 v3/v4 训练协议
+# ══════════════════════════════════════════════════════
+
+# ─── 数据 ───
+data:
+  zhilian_dir: "../zhilian_direct/zhilian_direct"  # 原始数据目录
+  synthetic_data_path: "./outputs/synthetic_data.csv"  # LLM合成数据
+  max_length: 256  # 岗位文本比实体名长，增大到256
+  encoding_format: "A"  # A=标准 B=描述增强 C=指令
+
+# ─── 模型 ───
+model:
+  name: "microsoft/deberta-v3-base"  # 或 BAAI/bge-large-zh-v1.5, hfl/chinese-roberta-wwm-ext-large
+  dropout: 0.15
+  proto_init_scale: 0.05  # 原型矩阵初始化缩放
+  prototype_path: "./outputs/prototype_matrix.npy"
+
+# ─── 训练 - Stage 1 (表示学习) ───
+stage1:
+  epochs: 15
+  lr_encoder: 2.0e-5
+  lr_classifier: 5.0e-5
+  label_smoothing: 0.1
+  rdrop_weight: 0.1
+  ib_ratio: 0.5  # IB+Uniform混合采样比例
+  warmup_ratio: 0.1
+  patience: 5
+  # 辅助损失权重
+  supcon_weight: 0.2
+  spancl_weight: 0.1
+  triplet_weight: 0.05
+  desc_align_weight: 0.1
+
+# ─── 训练 - Stage 2 (CWBS校准) ───
+stage2:
+  epochs: 8
+  lr: 1.0e-4
+  adaptive_tau: true
+  tau_fixed: 1.0
+  tau_min: 0.3
+  tau_max: 1.5
+  cwbs_ratio: 0.8  # CWBS采样比例
+  cwbs_weight_min: 0.1  # 最小权重防梯度消失
+  # 微分学习率: encoder冻结或低lr
+  freeze_encoder: false
+  lr_encoder: 1.0e-6
+
+# ─── 训练 - 通用 ───
+training:
+  n_folds: 5
+  batch_size: 16
+  weight_decay: 0.01
+  num_workers: 0
+  random_seed: 42
+  grad_clip: 1.0
+  use_amp: true  # 混合精度
+  device: ""  # 空=自动
+
+# ─── 推理 ───
+inference:
+  mc_samples: 5       # MC Dropout前向次数
+  knn_k: 20           # Bayesian kNN邻近数
+  knn_alpha: 0.15     # kNN融合权重
+  temperature: 1.5    # 温度缩放
+  tta_formats: ["A", "B", "C"]  # TTA编码格式
+
+# ─── 集成 ───
+ensemble:
+  models:
+    - backbone: "microsoft/deberta-v3-large"
+      loss: "focal+supcon"
+      tau: 0.5
+    - backbone: "microsoft/deberta-v3-large"
+      loss: "ce+ls"
+      tau: 1.0
+    - backbone: "microsoft/deberta-v3-base"
+      loss: "focal+supcon"
+      tau: 0.5
+    - backbone: "BAAI/bge-large-zh-v1.5"
+      loss: "cwbs"
+      tau: 1.0
+  entropy_scale: 2.0  # 熵感知动态权重
+
+# ─── 合成数据 ───
+synthesis:
+  api: "deepseek"  # deepseek | openai | glm
+  model: "deepseek-v4-pro"
+  api_key_env: "DEEPSEEK_API_KEY"
+  levels:
+    L1: { max_samples: 10, generate: 40 }   # ≤10条 → 生成40条
+    L2: { max_samples: 15, generate: 25 }   # 11-15条 → 生成25条
+    L3: { max_samples: 20, generate: 15 }   # 16-20条 → 生成15条
+    L4: { max_samples: 25, generate: 0 }    # >25条 → 不合成

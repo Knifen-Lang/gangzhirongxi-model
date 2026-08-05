@@ -1,0 +1,89 @@
+# ══════════════════════════════════════════════════════
+# Qwen2.5-7B + LoRA 微调 — 配置文件
+# 复用现有损失函数 (CWBS, Focal, SupCon, SpanCL, RDrop)
+# 目标: 87类岗位分类, 准确率 90%+
+# ══════════════════════════════════════════════════════
+
+# ─── 模型 ───
+model:
+  name: "Qwen/Qwen2.5-7B-Instruct"   # 基座模型
+  # 备选:
+  #   "Qwen/Qwen2.5-3B-Instruct"     # 更轻量, 更快
+  #   "Qwen/Qwen2.5-14B-Instruct"    # 更强, 需要 >16GB 显存
+
+# ─── LoRA 配置 ───
+lora:
+  r: 64                # LoRA rank (越高表达能力越强, 但参数越多)
+  alpha: 128           # LoRA alpha (通常 = 2*r)
+  dropout: 0.05        # LoRA dropout
+  target_modules:      # 注入 LoRA 的模块
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+# ─── 量化 ───
+quantization:
+  use_4bit: true
+  bnb_4bit_compute_dtype: "bfloat16"
+  bnb_4bit_use_double_quant: true
+  bnb_4bit_quant_type: "nf4"
+
+# ─── 训练 - Stage 1 (LoRA + 分类头联合表示学习) ───
+stage1:
+  epochs: 6            # LoRA 收敛快, 6 epoch 通常足够
+  lr_encoder: 2.0e-4   # LoRA 学习率 (通常 1e-4 ~ 5e-4)
+  lr_classifier: 5.0e-4  # 分类头学习率 (新初始化, 可以大一些)
+  label_smoothing: 0.1
+  rdrop_weight: 0.1
+  ib_ratio: 0.5        # IB + Uniform 混合采样
+  warmup_ratio: 0.1
+  patience: 3          # Early stopping
+  # 辅助损失权重 (适配 Qwen hidden states)
+  supcon_weight: 0.15
+  spancl_weight: 0.05
+  triplet_weight: 0.05
+
+# ─── 训练 - Stage 2 (CWBS 分类头校准) ───
+stage2:
+  epochs: 3
+  lr: 1.0e-4
+  adaptive_tau: true
+  tau_fixed: 1.0
+  tau_min: 0.3
+  tau_max: 1.5
+  cwbs_ratio: 0.8
+  cwbs_weight_min: 0.1
+  freeze_lora: true    # 冻结 LoRA, 仅训练分类头
+
+# ─── 训练 - 通用 ───
+training:
+  n_folds: 5
+  batch_size: 4        # 8GB 显存: batch_size=4
+  grad_accum: 4        # 梯度累积 → effective_batch=16
+  max_length: 512      # Qwen 支持更长上下文
+  weight_decay: 0.01
+  num_workers: 0       # Windows 用 0 避免多进程问题
+  random_seed: 42
+  grad_clip: 1.0
+  use_amp: true        # 混合精度 (节省显存)
+  device: ""            # 空=自动
+  encoding_format: "B" # B=Instruction格式 (推荐用于LLM微调)
+  dropout: 0.15
+
+# ─── 推理 ───
+inference:
+  mc_samples: 3        # MC Dropout (减少显存消耗)
+  knn_k: 20
+  knn_alpha: 0.15
+  temperature: 1.2
+  tta_formats: ["B", "A", "C"]
+
+# ─── 合成数据 (用 Qwen 自身也可以合成) ───
+synthesis:
+  api: "deepseek"
+  model: "deepseek-v4-pro"
+  api_key_env: "DEEPSEEK_API_KEY"
