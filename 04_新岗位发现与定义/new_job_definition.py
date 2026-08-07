@@ -561,6 +561,38 @@ def group_and_generate(rows, timeline_report_path=None, use_llm=False, llm_max=3
     return definitions
 
 
+def dedup_by_jaccard(jds):
+    """
+    簇内Jaccard抄袭检测（复用 graph_calibrator.py 同样逻辑）。
+    同公司+JD文本相似度>0.8 → 抄袭簇 → 每条JD权重=1/簇大小。
+    返回每条JD的权重列表。
+    """
+    n = len(jds)
+    texts = [str(r.get('skill_requirements', '')) for r in jds]
+    companies = [str(r.get('company_name', '')).strip() for r in jds]
+    factors = [1.0] * n   # 簇大小（1=独立JD）
+
+    for i in range(n):
+        if factors[i] != 1.0:
+            continue  # 已被归入前面的抄袭簇
+        cluster = [i]
+        for j in range(i + 1, n):
+            if factors[j] != 1.0:
+                continue
+            # 同公司 + 文本相似 > 0.8 = 抄袭
+            if companies[i] and companies[i] == companies[j]:
+                sim = SequenceMatcher(None, texts[i], texts[j]).ratio()
+                if sim > 0.8:
+                    cluster.append(j)
+        if len(cluster) > 1:
+            for idx in cluster:
+                factors[idx] = len(cluster)
+
+    # 权重 = 1/簇大小（抄袭簇越大，每条JD贡献越小）
+    weights = [1.0 / f for f in factors]
+    return weights, factors
+
+
 def build_definition(cluster_id, norm_name, jds, timeline_index):
     """为一个岗位类型合成定义"""
     n = len(jds)
@@ -570,27 +602,40 @@ def build_definition(cluster_id, norm_name, jds, timeline_index):
     canonical = name_counter.most_common(1)[0][0]
     aliases = [nm for nm, _ in name_counter.most_common(8) if nm != canonical]
 
-    # 收集全量文本+技能
+    # ── Jaccard抄袭去重（同 graph_calibrator.py） ──
+    jd_weights, cluster_factors = dedup_by_jaccard(jds)
+    # 统计通胀：簇大小≥3视为重度，2视为中度
+    inflate_heavy = sum(1 for f in cluster_factors if f >= 3)
+    inflate_medium = sum(1 for f in cluster_factors if f == 2)
+    inflate_light = 0  # Jaccard方法只有"抄袭"和"独立"两态
+    inflate_clean = sum(1 for f in cluster_factors if f == 1.0)
+
+    # 收集全量文本+技能（Jaccard去重权重）
     all_duties = []
-    all_required = []
-    all_bonus = []
+    all_required = []        # (skill_dict, weight)
+    all_bonus = []           # (skill_dict, weight)
     all_ai_signals = set()
     companies = []
     cities = []
     duty_counter = Counter()
-    inflation_flags = []
+    total_weight = 0.0       # 有效JD数（去重后）
 
-    for r in jds:
+    for i, r in enumerate(jds):
+        w = jd_weights[i]
+        total_weight += w
+
         text = str(r.get('skill_requirements', ''))
         duties = parse_duties(text)
         all_duties.extend(duties)
         for sent in duties:
-            for i in range(len(sent) - 1):
-                duty_counter[sent[i:i+2]] += 1
+            for c in range(len(sent) - 1):
+                duty_counter[sent[c:c+2]] += w  # 加权
 
         all_ai_signals |= extract_ai_signals_from_text(text)
-        all_required.extend(parse_skill_list(r.get('必备技能', '')))
-        all_bonus.extend(parse_skill_list(r.get('加分技能', '')))
+        for sk in parse_skill_list(r.get('必备技能', '')):
+            all_required.append((sk, w))
+        for sk in parse_skill_list(r.get('加分技能', '')):
+            all_bonus.append((sk, w))
 
         company = str(r.get('company_name', '')).strip()
         if company:
@@ -598,48 +643,76 @@ def build_definition(cluster_id, norm_name, jds, timeline_index):
         area = str(r.get('work_area', '')).strip()
         if area:
             cities.append(area)
-        inflation_flags.append(str(r.get('技能通胀', '')).strip())
 
     # ── 核心职责 ──
     core_duties = score_duties(all_duties, all_ai_signals, duty_counter, n)
     if len(core_duties) < 3:
         core_duties = all_duties[:5]
 
-    # ── 必备技能 ──
-    req_counter = Counter()
+    # ── 必备技能（Jaccard去重矫正） ──
+    req_counter_raw = Counter()    # 原始计数
+    req_counter_w = Counter()      # Jaccard去重计数
     req_levels = defaultdict(list)
-    for sk in all_required:
-        req_counter[sk['skill']] += 1
+    for sk, w in all_required:
+        req_counter_raw[sk['skill']] += 1
+        req_counter_w[sk['skill']] += w
         req_levels[sk['skill']].append(sk['level'])
     required_skills = []
-    for skill, cnt in req_counter.most_common():
-        support = cnt / n
-        if support < 0.20:
-            break
+    demoted_to_bonus = []          # 矫正后从必备降级到加分的技能
+    effective_n = max(total_weight, 1.0)
+    for skill, cnt_w in req_counter_w.most_common():
+        raw_support = req_counter_raw[skill] / n
+        corrected_support = cnt_w / effective_n
         modal_level = Counter(req_levels[skill]).most_common(1)[0][0]
         cat = 'AI新兴技能' if skill in all_ai_signals else '传统技术'
-        required_skills.append({'skill': skill, 'category': cat, 'proficiency': modal_level, 'support_pct': round(support, 2)})
+        skill_entry = {
+            'skill': skill, 'category': cat, 'proficiency': modal_level,
+            'support_pct': round(raw_support, 2),
+            'support_pct_corrected': round(corrected_support, 2),
+        }
+        if corrected_support >= 0.15:
+            required_skills.append(skill_entry)
+        elif corrected_support >= 0.08:
+            # 矫正后不足以当必备，但够格当加分 → 降级
+            demoted_to_bonus.append(skill_entry)
+        # else: 矫正后连加分都不够 → 丢弃
         if len(required_skills) >= 8:
             break
 
-    # ── 加分技能 ──
-    bonus_counter = Counter()
+    # ── 加分技能（Jaccard去重矫正 + 必备降级） ──
+    bonus_counter_raw = Counter()
+    bonus_counter_w = Counter()
     bonus_levels = defaultdict(list)
-    for sk in all_bonus:
-        bonus_counter[sk['skill']] += 1
+    for sk, w in all_bonus:
+        bonus_counter_raw[sk['skill']] += 1
+        bonus_counter_w[sk['skill']] += w
         bonus_levels[sk['skill']].append(sk['level'])
     req_skill_names = {s['skill'] for s in required_skills}
     bonus_skills = []
-    for skill, cnt in bonus_counter.most_common():
-        if skill in req_skill_names:
+
+    # 先加入从必备降级下来的技能（already validated）
+    for sk_entry in demoted_to_bonus:
+        if sk_entry['skill'] not in req_skill_names:
+            bonus_skills.append(sk_entry)
+
+    # 再加入原始加分技能（去重必备+已降级）
+    existing_bonus = {s['skill'] for s in bonus_skills}
+    for skill, cnt_w in bonus_counter_w.most_common():
+        if skill in req_skill_names or skill in existing_bonus:
             continue
-        support = cnt / n
-        if support < 0.10:
+        raw_support = bonus_counter_raw[skill] / n
+        corrected_support = cnt_w / effective_n
+        if corrected_support < 0.08:
             break
         modal_level = Counter(bonus_levels[skill]).most_common(1)[0][0]
         cat = 'AI新兴技能' if skill in all_ai_signals else '传统技术'
-        bonus_skills.append({'skill': skill, 'category': cat, 'proficiency': modal_level, 'support_pct': round(support, 2)})
-        if len(bonus_skills) >= 6:
+        bonus_skills.append({
+            'skill': skill, 'category': cat, 'proficiency': modal_level,
+            'support_pct': round(raw_support, 2),
+            'support_pct_corrected': round(corrected_support, 2),
+        })
+        existing_bonus.add(skill)
+        if len(bonus_skills) >= 8:  # 加分上限放宽，容纳降级技能
             break
 
     # ── 典型行业应用场景 ──
@@ -656,7 +729,18 @@ def build_definition(cluster_id, norm_name, jds, timeline_index):
     # ── 可溯源 ──
     company_set = list(dict.fromkeys(companies))
     city_set = list(dict.fromkeys(c for c in cities if c))
-    inflation_ratio = sum(1 for f in inflation_flags if f not in ('无', '', 'nan')) / n
+    # 通胀统计（基于Jaccard抄袭检测，同 graph_calibrator.py）
+    inflate_breakdown = {
+        '重度(簇≥3)': inflate_heavy,
+        '中度(簇=2)': inflate_medium,
+        '无': inflate_clean,
+    }
+    any_inflate = inflate_heavy + inflate_medium
+    # 通胀严重度：重度JD*1.0 + 中度JD*0.5 / 总JD
+    inflation_severity = round(
+        (inflate_heavy * 1.0 + inflate_medium * 0.5) / max(n, 1), 2
+    )
+    inflation_ratio = any_inflate / n if n else 0
 
     # ── 动态更新 ──
     dynamic = {'linked_timeline': False}
@@ -681,10 +765,13 @@ def build_definition(cluster_id, norm_name, jds, timeline_index):
         '典型行业应用场景': industries if industries else [{'industry': '通用信息技术', 'support_pct': 1.0}],
         'source_traceability': {
             'total_jds': n,
+            'effective_jds': round(total_weight, 1),  # 通胀矫正后有效JD数
             'unique_companies': len(company_set),
             'top_companies': company_set[:5],
             'top_cities': city_set[:5],
             'inflation_ratio': round(inflation_ratio, 2),
+            'inflation_severity': inflation_severity,    # 加权严重度(0~1)
+            'inflation_breakdown': inflate_breakdown,
         },
         '人工优化': {
             'status': 'pending_review',
@@ -734,8 +821,8 @@ def export_audit_excel(definitions, output_path):
     ws1.title = '待审核定义'
     headers = [
         '审核编号', '岗位名称', '别称', '归一化名',
-        'JD数', '公司数', '通胀比例',
-        '核心职责', '必备技能(支持率)', '加分技能(支持率)',
+        'JD数(原始)', '有效JD(矫正)', '通胀严重度(0~1)', '通胀分级(轻/中/重/无)',
+        '核心职责', '必备技能(原始%→矫正%)', '加分技能(原始%→矫正%)',
         '行业场景', '代表公司', '代表城市',
         'LLM精炼', '审核状态', '审核意见'
     ]
@@ -752,17 +839,20 @@ def export_audit_excel(definitions, output_path):
 
     for i, d in enumerate(definitions, 1):
         t = d['source_traceability']
+        bd = t.get('inflation_breakdown', {})
+        inflate_detail = f"重(簇≥3):{bd.get('重度(簇≥3)',0)} 中(簇=2):{bd.get('中度(簇=2)',0)} 独立:{bd.get('无',0)}"
         row = [
             d['人工优化']['audit_id'],
             d['岗位名称'],
             ' | '.join(d['别称'][:5]),
             d['归一化名'],
             t['total_jds'],
-            t['unique_companies'],
-            f"{t['inflation_ratio']:.0%}",
+            f"{t['effective_jds']:.0f}",
+            f"{t.get('inflation_severity', 0):.2f}",
+            inflate_detail,
             '\n'.join(f'{j+1}. {duty}' for j, duty in enumerate(d['核心职责'])),
-            '\n'.join(f"{s['skill']}({int(s['support_pct']*100)}%)" for s in d['必备技能']),
-            '\n'.join(f"{s['skill']}({int(s['support_pct']*100)}%)" for s in d['加分技能']),
+            '\n'.join(f"{s['skill']} {int(s['support_pct']*100)}%→{int(s.get('support_pct_corrected',s['support_pct'])*100)}%" for s in d['必备技能']),
+            '\n'.join(f"{s['skill']} {int(s['support_pct']*100)}%→{int(s.get('support_pct_corrected',s['support_pct'])*100)}%" for s in d['加分技能']),
             '\n'.join(f"{ind['industry']}({int(ind['support_pct']*100)}%)" for ind in d['典型行业应用场景']),
             ' | '.join(t['top_companies'][:5]),
             ' | '.join(t['top_cities'][:5]),

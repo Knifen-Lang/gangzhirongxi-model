@@ -47,6 +47,30 @@
 
 ---
 
+## 通胀矫正
+
+新岗位JD的技能通胀率（70.5%）是全量JD（8.8%）的8倍——公司追热门词大量互相抄，导致技能频率虚高。
+
+`new_job_definition.py` 内置通胀矫正：技能计数时按通胀级别加权，而非每条JD等权。
+
+| 通胀级别 | 权重 | 含义 |
+|---------|------|------|
+| 无 | 1.0 | 正常JD，权重不变 |
+| 轻度 | 0.7 | 与其他JD轻微相似 |
+| 中度 | 0.4 | 明显抄袭簇成员 |
+| 重度 | 0.15 | 高度同质化，几乎不计入 |
+
+**效果示例：**
+
+| 岗位 | 通胀 | 原始JD | 有效JD |
+|------|------|--------|--------|
+| 大模型算法工程师 | 81% | 95 | **45.4** |
+| AI产品经理 | 52% | 109 | **85.1** |
+
+技能支持率展示为 `原始%→矫正%`（如 RAG `20%→15%`），矫正后低于阈值（必备<15%、加分<8%）的技能会被自动过滤。
+
+---
+
 ## 输出字段
 
 ### JSON (`new_job_definitions.json`)
@@ -63,20 +87,24 @@
       "大模型推理优化与部署"
     ],
     "必备技能": [
-      {"skill": "大模型", "category": "AI新兴技能", "proficiency": "熟悉", "support_pct": 0.55}
+      {"skill": "大模型", "category": "AI新兴技能", "proficiency": "熟悉",
+       "support_pct": 0.55, "support_pct_corrected": 0.62}
     ],
     "加分技能": [
-      {"skill": "Python", "category": "传统技术", "proficiency": "精通", "support_pct": 0.20}
+      {"skill": "Python", "category": "传统技术", "proficiency": "精通",
+       "support_pct": 0.20, "support_pct_corrected": 0.22}
     ],
     "典型行业应用场景": [
       {"industry": "通用信息技术", "support_pct": 0.83}
     ],
     "source_traceability": {
       "total_jds": 95,
+      "effective_jds": 45.4,
       "unique_companies": 74,
       "top_companies": ["公司A", "公司B"],
       "top_cities": ["上海-长宁区", "郑州-郑东新区"],
-      "inflation_ratio": 0.12
+      "inflation_ratio": 0.81,
+      "inflation_breakdown": {"轻度": 12, "中度": 37, "重度": 28, "无": 18}
     },
     "人工优化": {
       "status": "pending_review",
